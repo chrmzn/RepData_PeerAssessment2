@@ -1,0 +1,353 @@
+---
+title: "Human and Economic Impact of Weather Events in United States 1950 - 2011"
+author: "Chris O'Brien"
+date: "13 June 2015"
+output: 
+    html_document:
+        toc: true
+        toc_depth: 3
+        keep_md: true
+---
+
+## Synopsis
+
+In this report we aim to determine weather events in the United States that are most harmful to population health and have the greatest economic impact. This is an exploratory analysis into the U.S. National Oceanic and Atmospheric Administration's (NOAA) storm database. The database contains records of weather events in the United States from 1950 to 2011 including injuries, fatalities, property and crop damage costs.
+
+Using all the data present in the database over that time we found that the Tsunamis represent the event with the greatest human impact to the United States. Hurricanes are the event that have the greatest economic consequences.
+
+Further analysis could go into a state by state analysis of the impact for a more regional recommendation on events municipal and government officials should plan for.
+
+## Data Processing
+
+### Required Libraries
+
+For this analysis there are a few libraries that we require to manipulate, clean and plot our data
+
+```{r library_load, message=FALSE}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+source("http://peterhaschke.com/Code/multiplot.R")
+```
+
+### Loading the data
+
+From the  U.S. National Oceanic and Atmospheric Administration's (NOAA) we obtained storm data from across the United States from 1950 to November 2011. 
+
+The data has been made available to us from our Coursera site. The data is a compressed bz2 file comprising a comma separated file of the Storm data from the years in question. 
+
+```{r data_download, cache=TRUE}
+download.file('https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2', 
+              destfile = 'StormData.csv.bz2', method = 'curl')
+weatherData <- data.table(read.csv('StormData.csv.bz2'))
+dim(weatherData)
+```
+
+As you can see we have 902,297 separate events ranging from 1950 to 2011. 
+
+```{r weather_summary}
+str(weatherData)
+```
+
+### Cleaning the Data 
+
+#### Parsing EVTYPE
+
+So we are attempting to answer two questions based on the type of event from the data. As it turns out we have over over 985 unique event types over that time range however many names do not describe an event and require some cleaning to bring them in line with the permitted storm events described in the [National Climatic Data Center Storm Events FAQ][1] 
+
+```{r initial_evtype_analysis}
+length(levels(weatherData$EVTYPE))
+```
+
+As we are setting out to answer two sets of questions, those events that have the greatest impact to human life and those with the greatest economic consequences. So rather than clean all the fields which would require a significant time investment we are going to see if we can filter for data relevant to our analysis.
+
+Taking the weather data we filter where we have any human impact (a Fatality or Injury greater than 0) or economic impact (Property Damage or Crop Damage greater than 0)
+
+```{r get_relevant_events}
+relevant_events <- weatherData %>% filter(FATALITIES > 0 | INJURIES > 0 | PROPDMG > 0 | CROPDMG > 0) 
+dim(relevant_events)
+```
+
+This has narrowed down our dataset to 254,633 weather events
+
+```{r evtype_summary}
+relevant_events %>% 
+    group_by(EVTYPE) %>% 
+    summarise(count=n()) %>% 
+    arrange(desc(count))
+```
+
+It has also lowered the amount of EVTYPES to 488. So to perform the cleaning we have taken the list of NOAA event types defined in the [FAQ (Page 6)][1] and saved it into a file called StormDataEventTypes
+
+```{r storm_data_event_types}
+readLines('StormDataEventTypes')
+```
+
+Using each of the category names we build a regular expression to match against the EVTYPE. To do this we remove the category from the end of the name (Eg. 'Drought Z' becomes 'Drought') then use this to create a look-forward regular expression ('Drought' becomes '(?=.*Drought)'). This will become the basis of processing of the EVTYPE field.
+
+```{r event_map}
+build_event_to_pattern_map <- function (eventTypeFile){
+    eventTypeValues <- readLines(eventTypeFile)
+    eventType <- list()
+    for (event in eventTypeValues){
+        spaceSplit <- strsplit(event, ' ')[[1]]
+        lastElement <- length(spaceSplit)
+        eventName <- paste(spaceSplit[-lastElement], collapse = ' ')
+        typeSplit <- strsplit(eventName, '/')[[1]]
+        regexpV <- vector('character', length = length(typeSplit))
+        for( i in seq_along(typeSplit) ){
+            if(i == 1){
+                regexpV[i] <- paste('(?=.*', typeSplit[i], '){1}', sep = '')
+            } else {
+                regexpV[i] <- paste('(?=.*', typeSplit[i], '){0,1}', sep = '')
+            }
+        }
+        if(grepl('Hurricane', eventName)){
+            regexpV <- c('(?=.*Hurricane)|(?=.*Typhoon)')
+        }
+        eventType[[eventName]] <- paste(regexpV, collapse ='')
+    }
+    eventType
+}
+
+event_map <- build_event_to_pattern_map('StormDataEventTypes')
+```
+
+Using this map of Storm Data Event to its regular expression pattern match we default the ProcessedEventType to 'Other' then loop over pattern and find which EVTYPE matches each event. 
+
+```{r apply_event_map}
+apply_event_map <- function (df, eventMap) {
+    df$ProcessedEventType <- 'Other'
+    for (i in seq_along(eventMap)) {
+        eventName <- names(eventMap[i])
+        eventMatch <- eventMap[[eventName]]
+        indexMatch <- grep(eventMatch,df$EVTYPE, ignore.case=T, perl=T)
+        df[indexMatch,]$ProcessedEventType <- eventName
+    }
+    df
+}
+
+relevant_events <- apply_event_map(relevant_events, event_map)
+```
+
+So we can see from below that we have 65,833 events left as unknown. Most of these beloning to the TSTM WIND category
+
+```{r check_remaining_evtype}
+dim(relevant_events %>% filter(ProcessedEventType=='Other'))
+relevant_events %>% 
+    filter(ProcessedEventType=='Other') %>% 
+    group_by(EVTYPE) %>% summarise(total=n()) %>% 
+    arrange(desc(total))
+```
+
+Lets clean up the final ones that can unambiguously be assigned to one of our known groups. Most will explain themselves except for 'URBAN/SML STREAM FLD' which according to the National Climatic Data Center Storm Events FAQ (page 44) 
+
+*Heavy rain situations, resulting in urban and/or small stream flooding, should be classified as a Heavy Rain*
+
+So we classify these as 'Heavy Rain'
+
+```{r manual_clean}
+relevant_events[relevant_events[,grepl('^TSTM',EVTYPE, perl=TRUE)],]$ProcessedEventType <- 'Thunderstorm Wind'
+relevant_events[relevant_events[,grepl('^THUNDER',EVTYPE, perl=TRUE)],]$ProcessedEventType <- 'Thunderstorm Wind'
+relevant_events[relevant_events[,EVTYPE=='WILD/FOREST FIRE'],]$ProcessedEventType <- 'Wildfire'
+relevant_events[relevant_events[,EVTYPE=='FOG'],]$ProcessedEventType <- 'Dense Fog'
+relevant_events[relevant_events[,EVTYPE=='HEAVY SURF'],]$ProcessedEventType <- 'High Surf'
+relevant_events[relevant_events[,EVTYPE=='URBAN/SML STREAM FLD'],]$ProcessedEventType <- 'Heavy Rain'
+dim(relevant_events %>% filter(ProcessedEventType=='Other'))
+```
+
+This leaves us with 1,268 events (0.5% of our total dataset) that we cannot not ascribe to a specific NOAA event type without a significant investment into the Remarks of the document. For the purpose of this analysis we shall leave those as 'Other' and comment around them should they turn out to have a specific impact.
+
+#### Parsing Event Date
+
+While we are aiming to answer those weather events with the greatest human and economic impact, it's likely that these have changed year on year so it's going to be worth knowing the year of the event
+
+```{r date_parse}
+relevant_events <- relevant_events %>% 
+    mutate(event_year=year(strptime(BGN_DATE, '%m/%d/%Y %H:%M:%S')))
+```
+
+We have applied all the generic filtering and processing that we wish to perform on the data so taking our data we seperate it out into our *human_impact_events* and *economic_impact_events*. This is for our final data cleaning task; applying the damage cost modifier to the property and crop damage values
+
+```{r data_seperation}
+human_impact_events <- relevant_events %>%
+    filter(FATALITIES > 0|INJURIES > 0)
+economic_impact_events <- relevant_events %>%
+    filter(PROPDMG > 0 | CROPDMG > 0)
+```
+
+#### Apply Damage Costs Modifier
+
+Before we can perform any economic calculations we need to apply the PROPDMGEXP/CROPDMGEXP to the PROPDMG and CROPDMG respectively.
+
+```{r existing_exp_values}
+economic_impact_events %>% 
+    filter(PROPDMG > 0) %>% 
+    group_by(PROPDMGEXP) %>% 
+    summarise(count=n())
+economic_impact_events %>% 
+    filter(CROPDMG > 0) %>% 
+    group_by(CROPDMGEXP) %>% 
+    summarise(count=n())
+```
+
+We can see that there are values other than those defined in the [FAQ][1] ('K','M', 'B' and '') and that we have case differences. We will start the clean by modifying all the EXP values to lower case.
+
+```{r confirm_bad_value_impact}
+economic_impact_events <- economic_impact_events %>% 
+    mutate(PROPDMGEXP=tolower(PROPDMGEXP),CROPDMGEXP=tolower(CROPDMGEXP))
+dim(economic_impact_events %>% filter(PROPDMG > 0, !PROPDMGEXP %in% c('k','m','b','')))
+dim(economic_impact_events %>% filter(CROPDMG > 0, !CROPDMGEXP %in% c('k','m','b','')))
+```
+
+As we cannot be sure on the meaning of those EXP values not defined in the FAQ and they represent such a small percentage of the events 0.1% and 0.05% for Property and Crop damages respectively.
+
+```{r remove_events}
+matched_events <- economic_impact_events[,(CROPDMG>0&CROPDMGEXP %in% c('k','m','b',''))|
+                                             (PROPDMG>0&PROPDMGEXP %in% c('k','m','b',''))]
+economic_impact_events <- economic_impact_events[matched_events,]
+dim(economic_impact_events)
+```
+
+With this settled it is just left for us to apply the value modifier to the damage.
+
+```{r apply_cost_modifier, cache=TRUE}
+apply_cost_modifier <- function ( cost, modifier ){
+    if(modifier == 'b'){
+        cost <- cost * 100000000
+    } else if (modifier == 'm' ) {
+        cost <- cost * 1000000
+    } else if (modifier == 'k' ) {
+        cost <- cost * 1000
+    }
+    cost
+}
+
+economic_impact_events <- economic_impact_events %>%
+    mutate(property_cost=mapply(apply_cost_modifier, PROPDMG, PROPDMGEXP),
+           crop_cost=mapply(apply_cost_modifier, CROPDMG, CROPDMGEXP)) %>%
+    mutate(total_costs=property_cost + crop_cost)
+```
+
+With the costs calculated we are just left to apply an inflation modifier
+
+#### Apply Inflation Changes
+
+As the costs are relative to each year we should bring in all the costs to be inline with the final year of our data. In order to do this we need to download the CPI/Inflation data from the [Bureau of Labor Statistics][2]
+
+Once it's downloaded we have to aggregate by year and pull the avg_cpi for each year.
+
+```{r inflation_download, cache=TRUE}
+download.file('http://download.bls.gov/pub/time.series/cu/cu.data.2.Summaries', 'CPI_Data.txt', method = 'curl')
+cpi_data <- read.delim('CPI_Data.txt')
+cpi_year <- data.table(cpi_data %>% group_by(year) %>% summarise(avg_cpi=mean(value)))
+cpi_year <- cpi_year %>% mutate(event_year=year) %>% select(event_year, avg_cpi)
+```
+
+Using the yearly average CPI values we merge it into our *economic_impact_events* and scale the price to the its 2011 USD value
+
+```{r apply_cpi}
+cpi_2011 <- (cpi_year %>% filter(event_year=='2011'))[['avg_cpi']]
+economic_impact_events <- merge(economic_impact_events, cpi_year, by='event_year')
+economic_impact_events <- economic_impact_events %>% 
+    mutate(property_cost=property_cost*(cpi_2011/avg_cpi),
+           crop_cost=crop_cost*(cpi_2011/avg_cpi),
+           total_costs=total_costs*(cpi_2011/avg_cpi))
+```
+
+With all out data cleaning complete we are left to simply select the fields relevant for our analysis
+
+```{r final_selection}
+human_impact_events <- human_impact_events %>%
+    select(event_year, STATE, EVTYPE, ProcessedEventType, FATALITIES, INJURIES)
+economic_impact_events <- economic_impact_events %>%
+    select(event_year, STATE, EVTYPE, ProcessedEventType, property_cost, crop_cost, total_costs)
+```
+
+## Results
+
+### Harm to Population Health
+
+We are interested in gathering those weather events across the United States that have have the most significant impact to human health. 
+
+Taking a simple average of fatalities and injuries we can see that the 'Tsunami' tops both the fatalities and injuries  
+
+```{r arrange_human_impact}
+totals <- human_impact_events %>% 
+    group_by(ProcessedEventType) %>% 
+    summarise(fatalities=mean(FATALITIES), 
+              injuries=mean(INJURIES)) %>% 
+    arrange(desc(fatalities))
+totals
+totals %>% arrange(desc(injuries))
+```
+
+```{r plot_fatalities, fig.width=15, message=FALSE}
+fatalities <- totals %>% select(ProcessedEventType, fatalities) %>% arrange(desc(fatalities))
+fatalities <- gather(fatalities, human_impact, count, -ProcessedEventType)
+injuries <- totals %>% select(ProcessedEventType, injuries) %>% arrange(desc(injuries))
+injuries <- gather(injuries, human_impact, count, -ProcessedEventType)
+fate_plot <- ggplot(fatalities[1:10], aes(x=reorder(ProcessedEventType, count), 
+                              y=count, fill=human_impact)) +
+    geom_bar(stat = 'identity')  + coord_flip() + labs(x='Weather Event', y='Fatalities') +
+    theme(legend.position='none', plot.title=element_text(size = 15)) + 
+    ggtitle('Top 10 Average Weather Fatalities 1950-2011')
+inj_plot <- ggplot(injuries[1:10], aes(x=reorder(ProcessedEventType, count), 
+                              y=count, fill=human_impact)) +
+    geom_bar(stat = 'identity')  + coord_flip() + labs(x='', y='Fatalities') +
+    theme(legend.position='none', plot.title=element_text(size = 15)) + 
+    ggtitle('Top 10 Average Weather Injuries 1950-2011') + 
+    scale_fill_manual(values=c("blue"))
+multiplot(fate_plot, inj_plot, cols=2)
+```
+
+Arguably we could make a distinction between human impact weight of a fatality vs. injury but we can confidently say that for recorded events from 1950 to 2011 that a Tsunami is likely to have the greatest human impact to the United States.
+
+### Economic Consequences
+
+Taking a look into the data it looks as though our inflation modification has correctly scaled the costs and the only real difference we see between the years is the overall disaster frequencies. We are using the log of the total costs in order to account for the skew in the data.
+
+```{r economic_costs, fig.width=10, fig.height=10, message=FALSE}
+ggplot(economic_impact_events, aes(x=log(total_costs))) + 
+    ggtitle('Histogram of Total Disaster Costs (1950-2011)') +
+    labs(x='Log(Total Cost(USD))') + geom_histogram() + facet_wrap(~event_year) + 
+    theme(legend.position='none')
+```
+
+As above we take the average total cost by weather event type and sort in decreasing order. 
+
+```{r}
+top_events <- economic_impact_events %>% 
+    group_by(ProcessedEventType) %>% 
+    summarise(cost=mean(total_costs)) %>% 
+    mutate(cost=cost/1000000) %>%
+    arrange(desc(cost))
+top_events
+top_events <- gather(top_events[1:10], economic_cost, cost, -ProcessedEventType)
+ggplot(top_events, aes(x=reorder(ProcessedEventType, cost), 
+                       y=cost, fill=economic_cost)) + 
+    geom_bar(stat='identity') + coord_flip() + labs(x='Weather Event',
+                                                    y='Average Cost (1,000,000 USD)') +
+    theme(legend.position='none') + ggtitle('Top 10 Weather Events by Average Cost')
+```
+
+Interestingly we can see from the plot that Hurricane (Typhoon) tops the weather events with the greatest average costs.
+
+## Summary
+
+Our analysis has demonstrated that Tsunamis top the average human impact count and that Hurricane (Typhoons) represent those with the greatest average econonmic costs.
+
+However it should be noted that there are only two recorded Tsunamis during our data period and more data could be required to get a more consistent fatality record
+
+```{r}
+human_impact_events %>% 
+    group_by(ProcessedEventType) %>% summarise(count=n()) %>% 
+    arrange(desc(count)) %>% filter(ProcessedEventType=='Tsunami')
+```
+
+Further analysis could take place to determine which weather events most effect each state within the United States. This could improve planning undertaken by municipal and government officials for future extreme weather events
+
+
+[1]: https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf
+[2]: http://www.bls.gov/cpi/
